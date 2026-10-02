@@ -1,0 +1,21 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python 虚拟环境
+backend/venv/
+venv/
+
+# SQLite 数据库
+*.db
+*.sqlite3
+
+# 敏感配置（含真实 SMTP 密码，禁止上传）
+backend/config.py
+
+# 上传文件（运行时生成）
+backend/uploads/
+
+# 环境变量
+.env
