@@ -19,3 +19,7 @@ backend/uploads/
 
 # 环境变量
 .env
+
+# 部署产物（内含敏感配置，禁止上传）
+deploy.zip
+*.tar.gz

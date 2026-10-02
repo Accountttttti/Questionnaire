@@ -1162,5 +1162,30 @@ def submit_questionnaire(qid):
     })
 
 
+# 前端打包产物目录（生产环境由后端统一托管）
+DIST_DIR = Path(__file__).parent.parent / "frontend" / "dist"
+
+
+@app.route("/")
+def serve_index():
+    return send_from_directory(DIST_DIR, "index.html")
+
+
+@app.route("/<path:path>")
+def serve_frontend(path):
+    if path.startswith("api/") or path.startswith("uploads/"):
+        return jsonify({"error": "not found"}), 404
+    candidate = DIST_DIR / path
+    if candidate.is_file():
+        return send_from_directory(DIST_DIR, path)
+    return send_from_directory(DIST_DIR, "index.html")
+
+
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    import os
+
+    from waitress import serve
+
+    port = int(os.environ.get("PORT", "8080"))
+    print(f"问卷系统已启动：http://0.0.0.0:{port}")
+    serve(app, host="0.0.0.0", port=port)
