@@ -2,6 +2,7 @@ import io
 import json
 import secrets
 import smtplib
+import string
 import uuid
 from email.header import Header
 from email.mime.text import MIMEText
@@ -256,7 +257,12 @@ def exam_parse():
     title_col = col("题干")
     ans_col = col("正确答案")
     score_col = col("分值")
-    opt_cols = [col("选项A"), col("选项B"), col("选项C"), col("选项D")]
+    opt_cols = []
+    opt_letters = []
+    for i, h in enumerate(header):
+        if h.startswith("选项") and h[2:] and h[2:] in string.ascii_uppercase:
+            opt_cols.append(i)
+            opt_letters.append(h[2:])
 
     if type_col < 0 or title_col < 0 or ans_col < 0:
         return jsonify({"error": "缺少必要列：题型 / 题干 / 正确答案"}), 400
@@ -280,13 +286,14 @@ def exam_parse():
 
         qtype = EXAM_TYPE_MAP[type_raw]
 
-        options = []
-        for cidx in opt_cols:
-            if cidx < 0:
+        opt_pairs = []
+        for cidx, letter in zip(opt_cols, opt_letters):
+            if cidx >= len(cells):
                 continue
             text = str(cells[cidx]).strip() if cells[cidx] is not None else ""
             if text:
-                options.append(text)
+                opt_pairs.append((letter, text))
+        options = [text for _, text in opt_pairs]
 
         answer = str(cells[ans_col]).strip() if cells[ans_col] is not None else ""
         score_val = cells[score_col] if score_col >= 0 else None
@@ -317,13 +324,12 @@ def exam_parse():
             if not options:
                 warnings.append(f"第{idx}行：缺少选项，已跳过")
                 continue
-            letters = "".join(ch for ch in answer.upper() if ch in "ABCD")
+            letters = "".join(ch for ch in answer.upper() if ch in string.ascii_uppercase)
             correct_set = set(letters)
             if not letters:
                 warnings.append(f"第{idx}行：缺少正确答案")
             opt_objs = []
-            for oi, text in enumerate(options):
-                letter = "ABCD"[oi] if oi < 4 else ""
+            for letter, text in opt_pairs:
                 opt_objs.append({"text": text, "is_correct": letter in correct_set})
             q = {"type": qtype, "title": title, "score": score, "options": opt_objs}
 

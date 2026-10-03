@@ -481,7 +481,7 @@ onMounted(load)
           <button class="mini add" @click="downloadTemplate">下载模板</button>
           <button class="mini add" @click="pickExcel">上传试卷</button>
           <input ref="excelInput" type="file" accept=".xlsx" class="hidden-input" @change="onExcel" />
-          <span class="fs-hint">一行一题：题型 / 题干 / 选项A-D / 正确答案 / 分值</span>
+          <span class="fs-hint">一行一题：题型 / 题干 / 选项（支持多个）/ 正确答案 / 分值</span>
         </div>
 
         <div v-for="(q, qi) in questions" :key="qi" class="card" :ref="el => (cardRefs[qi] = el)">
