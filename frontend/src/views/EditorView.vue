@@ -1,9 +1,11 @@
 <script setup>
 import { ref, computed, onMounted, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { useUserStore } from '../stores/user.js'
 
 const route = useRoute()
 const router = useRouter()
+const user = useUserStore()
 const qid = route.params.id
 
 const title = ref('')
@@ -272,7 +274,7 @@ async function insertImage(ci) {
     fd.append('file', file)
     const res = await fetch('/api/upload', {
       method: 'POST',
-      headers: { Authorization: localStorage.getItem('token') || '' },
+      headers: { Authorization: user.token },
       body: fd,
     })
     const data = await res.json()
@@ -287,7 +289,7 @@ async function insertImage(ci) {
 
 async function load() {
   const res = await fetch(`/api/questionnaires/${qid}`, {
-    headers: { Authorization: localStorage.getItem('token') || '' },
+    headers: { Authorization: user.token },
   })
   const data = await res.json()
   if (res.ok) {
@@ -323,7 +325,7 @@ async function save(statusToSet = null) {
     method: 'PUT',
     headers: {
       'Content-Type': 'application/json',
-      Authorization: localStorage.getItem('token') || '',
+      Authorization: user.token,
     },
     body: JSON.stringify(body),
   })
@@ -402,7 +404,7 @@ function pickExcel() {
 
 async function downloadTemplate() {
   const res = await fetch('/api/exam/template', {
-    headers: { Authorization: localStorage.getItem('token') || '' },
+    headers: { Authorization: user.token },
   })
   if (!res.ok) {
     const data = await res.json().catch(() => ({}))
@@ -426,7 +428,7 @@ async function onExcel(e) {
   fd.append('file', file)
   const res = await fetch('/api/exam/parse', {
     method: 'POST',
-    headers: { Authorization: localStorage.getItem('token') || '' },
+    headers: { Authorization: user.token },
     body: fd,
   })
   const data = await res.json()
@@ -442,7 +444,110 @@ async function onExcel(e) {
   }
 }
 
-onMounted(load)
+const aiKeyModal = ref(false)
+const aiKeyInput = ref('')
+const aiKeyHas = ref(false)
+const aiKeySaving = ref(false)
+const aiGenModal = ref(false)
+const aiPrompt = ref('')
+const aiGenerating = ref(false)
+
+const canAiGen = computed(() => qtype.value === 'exam' || qtype.value === 'test')
+
+async function checkAiKey() {
+  try {
+    const res = await fetch('/api/me/ai-key', { headers: user.authHeaders() })
+    const data = await res.json()
+    if (res.ok) aiKeyHas.value = !!data.has_key
+  } catch (e) {}
+}
+
+function openAiKey() {
+  aiKeyInput.value = ''
+  aiKeyModal.value = true
+}
+
+async function saveAiKey() {
+  if (!aiKeyInput.value.trim()) {
+    alert('请输入 API Key')
+    return
+  }
+  aiKeySaving.value = true
+  const res = await fetch('/api/me/ai-key', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...user.authHeaders() },
+    body: JSON.stringify({ ai_key: aiKeyInput.value.trim() }),
+  })
+  aiKeySaving.value = false
+  if (res.ok) {
+    aiKeyHas.value = true
+    aiKeyModal.value = false
+    alert('API Key 已保存')
+  } else {
+    const data = await res.json().catch(() => ({}))
+    alert(data.error || '保存失败')
+  }
+}
+
+async function deleteAiKey() {
+  if (!confirm('确定删除已配置的 API Key？')) return
+  const res = await fetch('/api/me/ai-key', { method: 'DELETE', headers: user.authHeaders() })
+  if (res.ok) {
+    aiKeyHas.value = false
+    aiKeyInput.value = ''
+    alert('已删除 API Key')
+  } else {
+    const data = await res.json().catch(() => ({}))
+    alert(data.error || '删除失败')
+  }
+}
+
+function openAiGen() {
+  aiPrompt.value = ''
+  aiGenModal.value = true
+}
+
+async function aiGenerate() {
+  if (!aiPrompt.value.trim()) {
+    alert('请先描述你想生成的问卷')
+    return
+  }
+  aiGenerating.value = true
+  const res = await fetch('/api/ai/generate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...user.authHeaders() },
+    body: JSON.stringify({ type: qtype.value, mode: mode.value, prompt: aiPrompt.value.trim() }),
+  })
+  aiGenerating.value = false
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok) {
+    alert(data.error || '生成失败')
+    return
+  }
+  const isExam = qtype.value === 'exam'
+  const isJump = qtype.value === 'test' && mode.value === 'jump'
+  const hasExisting = questions.value.length || result_cards.value.length
+  if (hasExisting && !confirm('AI 出卷将覆盖当前所有题目' + (isExam ? '' : '和结果卡片') + '，确定继续？')) return
+  if (isJump) {
+    questions.value = (data.questions || []).map((q) => ({
+      type: 'single',
+      title: q.title || '',
+      options: (q.options || []).map((o) => ({ text: o.text || '', jump_to: o.jump_to || '' })),
+    }))
+  } else {
+    questions.value = data.questions || []
+  }
+  if (!isExam) {
+    result_cards.value = (data.result_cards || []).map((c) => ({ ...c, _id: uid() }))
+  }
+  aiGenModal.value = false
+  aiPrompt.value = ''
+}
+
+onMounted(() => {
+  load()
+  checkAiKey()
+})
 </script>
 
 <template>
@@ -469,7 +574,13 @@ onMounted(load)
       </section>
 
       <section class="section">
-        <h2>题目（{{ questions.length }}）</h2>
+        <div class="section-head">
+          <h2>题目（{{ questions.length }}）</h2>
+          <div class="section-actions">
+            <button v-if="canAiGen" class="ai-btn" @click="openAiGen">✨ AI 出卷</button>
+            <button class="ai-btn plain" @click="openAiKey">AI 设置</button>
+          </div>
+        </div>
 
         <div v-if="qtype === 'exam'" class="fullscore-row">
           <label class="fs-label">试卷总分</label>
@@ -657,6 +768,37 @@ onMounted(load)
         <button class="add-question" @click="addCard">＋ 添加结果卡片</button>
       </section>
     </main>
+
+    <div v-if="aiKeyModal" class="mask" @click.self="aiKeyModal = false">
+      <div class="modal">
+        <h3>AI 设置</h3>
+        <p class="modal-desc">填入你的 DeepSeek API Key（在 platform.deepseek.com 获取），用于 AI 出卷。</p>
+        <input v-model="aiKeyInput" class="modal-input" type="password" placeholder="sk-..." />
+        <p v-if="aiKeyHas" class="modal-tip">当前账号已配置 API Key，重新填写可覆盖。</p>
+        <div class="modal-actions">
+          <button v-if="aiKeyHas" class="ghost delete" @click="deleteAiKey">删除 Key</button>
+          <button class="ghost" @click="aiKeyModal = false">关闭</button>
+          <button class="primary" :disabled="aiKeySaving" @click="saveAiKey">{{ aiKeySaving ? '保存中...' : '保存' }}</button>
+        </div>
+      </div>
+    </div>
+
+    <div v-if="aiGenModal" class="mask" @click.self="aiGenModal = false">
+      <div class="modal">
+        <h3>AI 出卷</h3>
+        <p class="modal-desc">描述你想要生成的问卷，AI 会生成整套内容并填进编辑器（可继续修改）。</p>
+        <textarea
+          v-model="aiPrompt"
+          class="modal-textarea"
+          :placeholder="qtype === 'exam' ? '例如：出 5 道 Vue3 基础单选题，含答案和分值，中等难度' : '例如：性格测试，测你是哪种打工人，10 道单选题 + 3 档结果'"
+        ></textarea>
+        <p v-if="!aiKeyHas" class="modal-warn">还没有配置 API Key，请先点「AI 设置」填写。</p>
+        <div class="modal-actions">
+          <button class="ghost" @click="aiGenModal = false">关闭</button>
+          <button class="primary" :disabled="aiGenerating || !aiKeyHas" @click="aiGenerate">{{ aiGenerating ? '生成中...' : '生成' }}</button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -1165,5 +1307,130 @@ onMounted(load)
   font-size: 12px;
   cursor: pointer;
   outline: none;
+}
+
+.section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.section-head h2 {
+  margin: 0;
+}
+
+.section-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.ai-btn {
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #fff;
+  background: linear-gradient(135deg, #6366f1, #8b5cf6);
+  border: none;
+  border-radius: 10px;
+  cursor: pointer;
+}
+
+.ai-btn.plain {
+  color: #6b7280;
+  background: #fff;
+  border: 1px solid var(--border);
+  font-weight: 500;
+}
+
+.ai-btn.plain:hover {
+  border-color: #6366f1;
+  color: #6366f1;
+}
+
+.mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  z-index: 200;
+}
+
+.modal {
+  width: 100%;
+  max-width: 460px;
+  background: #fff;
+  border-radius: 18px;
+  padding: 28px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.2);
+}
+
+.modal h3 {
+  margin: 0 0 6px;
+  font-size: 19px;
+}
+
+.modal-desc {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 0 0 20px;
+  line-height: 1.6;
+}
+
+.modal-input,
+.modal-textarea {
+  width: 100%;
+  padding: 12px 14px;
+  font-size: 14px;
+  font-family: inherit;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  outline: none;
+  box-sizing: border-box;
+}
+
+.modal-textarea {
+  min-height: 110px;
+  resize: vertical;
+}
+
+.modal-input:focus,
+.modal-textarea:focus {
+  border-color: #6366f1;
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.12);
+}
+
+.modal-tip {
+  font-size: 12px;
+  color: #059669;
+  margin: 10px 0 0;
+}
+
+.modal-warn {
+  font-size: 12px;
+  color: #f59e0b;
+  margin: 10px 0 0;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+  margin-top: 20px;
+}
+
+.modal-actions .delete {
+  color: #ef4444;
+  border-color: #fecaca;
+  margin-right: auto;
+}
+
+.modal-actions .delete:hover {
+  border-color: #ef4444;
 }
 </style>

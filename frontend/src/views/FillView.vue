@@ -3,10 +3,12 @@ import { ref, computed, onMounted, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import QRCode from 'qrcode'
 import html2canvas from 'html2canvas'
+import { useUserStore } from '../stores/user.js'
 
 const route = useRoute()
 const router = useRouter()
 const qid = route.params.id
+const user = useUserStore()
 
 const q = ref(null)
 const answers = ref([])
@@ -26,6 +28,7 @@ const copied = ref(false)
 const qrDataUrl = ref('')
 const generating = ref(false)
 const shareRef = ref(null)
+const showReview = ref(false)
 
 function isAnswered(qi) {
   const a = answers.value[qi]
@@ -45,7 +48,7 @@ const curQuestion = computed(() => (q.value ? q.value.questions[current.value] :
 
 async function load() {
   const res = await fetch(`/api/questionnaires/${qid}/public`, {
-    headers: { Authorization: localStorage.getItem('token') || '' },
+    headers: { Authorization: user.token },
   })
   const data = await res.json()
   loading.value = false
@@ -113,7 +116,7 @@ async function confirmJumpSubmit() {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      Authorization: localStorage.getItem('token') || '',
+      Authorization: user.token,
     },
     body: JSON.stringify({ answers: answers.value, result_label: confirmResult.value }),
   })
@@ -137,7 +140,7 @@ async function submit() {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      Authorization: localStorage.getItem('token') || '',
+      Authorization: user.token,
     },
     body: JSON.stringify({ answers: answers.value }),
   })
@@ -232,6 +235,7 @@ onMounted(load)
         <div class="result-text" v-html="result.result_text"></div>
       </template>
       <div class="result-actions">
+        <button v-if="q.type === 'exam'" class="ghost" @click="showReview = true">查看答案</button>
         <button class="ghost" @click="restart">再答一次</button>
         <button class="ghost" @click="copyLink">{{ copied ? '已复制链接' : '复制分享链接' }}</button>
         <button class="primary" @click="openShare">分享图片</button>
@@ -357,6 +361,40 @@ onMounted(load)
           <button class="primary" :disabled="generating" @click="saveImage">
             {{ generating ? '生成中...' : '保存图片' }}
           </button>
+        </div>
+      </div>
+    </div>
+
+    <div v-if="showReview" class="review-mask" @click.self="showReview = false">
+      <div class="review-panel">
+        <div class="review-head">
+          <h3>答案与解析</h3>
+          <button class="review-close" @click="showReview = false">关闭</button>
+        </div>
+        <div class="review-list">
+          <div v-for="(item, i) in result.review" :key="i" class="review-item">
+            <div class="ri-title">
+              <span class="ri-num">{{ i + 1 }}</span>
+              <span class="ri-text">{{ item.title }}</span>
+              <span class="ri-badge" :class="item.correct ? 'ok' : 'bad'">{{ item.correct ? '答对' : '答错' }}</span>
+            </div>
+            <div v-if="item.options.length" class="ri-options">
+              <div
+                v-for="(o, oi) in item.options"
+                :key="oi"
+                class="ri-option"
+                :class="{ correct: o.is_correct, wrong: o.chosen && !o.is_correct }"
+              >
+                <span class="ri-mark">{{ o.is_correct ? '✓' : (o.chosen ? '✗' : '') }}</span>
+                {{ o.text }}
+              </div>
+            </div>
+            <div v-else class="ri-fill">
+              <div class="ri-line"><span class="ri-label">参考答案</span>{{ item.correct_answer.join(' / ') || '—' }}</div>
+              <div class="ri-line"><span class="ri-label">我的答案</span>{{ item.my_answer.join(' / ') || '（未作答）' }}</div>
+            </div>
+            <div class="ri-score">本题得分：{{ item.score }} 分</div>
+          </div>
         </div>
       </div>
     </div>
@@ -862,5 +900,174 @@ onMounted(load)
 
 .cp-actions button {
   flex: 1;
+}
+
+.review-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  z-index: 300;
+}
+
+.review-panel {
+  width: 100%;
+  max-width: 620px;
+  max-height: 85vh;
+  background: #fff;
+  border-radius: 20px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.review-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 18px 24px;
+  border-bottom: 1px solid var(--border);
+}
+
+.review-head h3 {
+  margin: 0;
+  font-size: 17px;
+  color: var(--text);
+}
+
+.review-close {
+  border: none;
+  background: none;
+  color: var(--muted);
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.review-close:hover {
+  color: var(--text);
+}
+
+.review-list {
+  overflow-y: auto;
+  padding: 16px 20px;
+}
+
+.review-item {
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 16px;
+  margin-bottom: 14px;
+}
+
+.review-item:last-child {
+  margin-bottom: 0;
+}
+
+.ri-title {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.ri-num {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border-radius: 7px;
+  background: rgba(99, 102, 241, 0.1);
+  color: var(--primary);
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.ri-text {
+  flex: 1;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.5;
+  color: var(--text);
+}
+
+.ri-badge {
+  flex: none;
+  font-size: 12px;
+  padding: 3px 10px;
+  border-radius: 20px;
+  font-weight: 600;
+}
+
+.ri-badge.ok {
+  background: #dcfce7;
+  color: #16a34a;
+}
+
+.ri-badge.bad {
+  background: #fee2e2;
+  color: #dc2626;
+}
+
+.ri-options {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ri-option {
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: #f8fafc;
+  font-size: 14px;
+  color: #374151;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid transparent;
+}
+
+.ri-option.correct {
+  background: #dcfce7;
+  border-color: #86efac;
+  color: #15803d;
+}
+
+.ri-option.wrong {
+  background: #fee2e2;
+  border-color: #fca5a5;
+  color: #b91c1c;
+}
+
+.ri-mark {
+  font-weight: 700;
+}
+
+.ri-fill {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ri-line {
+  font-size: 14px;
+  color: #374151;
+}
+
+.ri-label {
+  display: inline-block;
+  min-width: 64px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.ri-score {
+  margin-top: 10px;
+  font-size: 13px;
+  color: var(--muted);
+  text-align: right;
 }
 </style>

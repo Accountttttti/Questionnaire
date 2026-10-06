@@ -13,6 +13,8 @@ SCHEMA = [
         avatar TEXT DEFAULT '',
         email TEXT DEFAULT '',
         phone TEXT DEFAULT '',
+        role TEXT NOT NULL DEFAULT 'user',
+        ai_key TEXT DEFAULT '',
         created_at TEXT DEFAULT (datetime('now'))
     )
     """,
@@ -95,6 +97,22 @@ SCHEMA = [
         created_at TEXT DEFAULT (datetime('now'))
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS hunter_keys (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT UNIQUE NOT NULL,
+        key TEXT UNIQUE NOT NULL,
+        created_at TEXT DEFAULT (datetime('now'))
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS hunter_applications (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT UNIQUE NOT NULL,
+        classification TEXT NOT NULL DEFAULT '',
+        created_at TEXT DEFAULT (datetime('now'))
+    )
+    """,
 ]
 
 
@@ -110,6 +128,13 @@ def init_db():
     conn.execute("PRAGMA journal_mode=WAL")
     for stmt in SCHEMA:
         conn.execute(stmt)
+
+    ucols = [r["name"] for r in conn.execute("PRAGMA table_info(users)").fetchall()]
+    if "role" not in ucols:
+        conn.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")
+    if "ai_key" not in ucols:
+        conn.execute("ALTER TABLE users ADD COLUMN ai_key TEXT DEFAULT ''")
+
     cols = [r["name"] for r in conn.execute("PRAGMA table_info(questionnaires)").fetchall()]
     if "description" not in cols:
         conn.execute("ALTER TABLE questionnaires ADD COLUMN description TEXT DEFAULT ''")
@@ -135,6 +160,23 @@ def init_db():
     rcols = [r["name"] for r in conn.execute("PRAGMA table_info(result_cards)").fetchall()]
     if "label" not in rcols:
         conn.execute("ALTER TABLE result_cards ADD COLUMN label TEXT NOT NULL DEFAULT ''")
+
+    hcols = [r["name"] for r in conn.execute("PRAGMA table_info(hunter_applications)").fetchall()]
+    if "name" in hcols:
+        conn.execute(
+            "CREATE TABLE hunter_applications_new ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "email TEXT UNIQUE NOT NULL,"
+            "classification TEXT NOT NULL DEFAULT '',"
+            "created_at TEXT DEFAULT (datetime('now')))"
+        )
+        conn.execute(
+            "INSERT INTO hunter_applications_new (id, email, classification, created_at) "
+            "SELECT id, email, classification, created_at FROM hunter_applications"
+        )
+        conn.execute("DROP TABLE hunter_applications")
+        conn.execute("ALTER TABLE hunter_applications_new RENAME TO hunter_applications")
+
     conn.execute(
         "UPDATE questionnaires SET published_at = updated_at "
         "WHERE status = 'published' AND published_at IS NULL"

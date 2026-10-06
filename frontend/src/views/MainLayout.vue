@@ -1,33 +1,16 @@
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, onMounted, onBeforeUnmount } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { useHunterStore } from '../stores/hunter.js'
+import { useUserStore } from '../stores/user.js'
 
 const route = useRoute()
 const router = useRouter()
 
-const username = ref(localStorage.getItem('username') || '')
-const avatar = ref('')
 const menuOpen = ref(false)
-
-const initial = computed(() => (username.value || '?').charAt(0))
-
-function authHeaders() {
-  return { Authorization: localStorage.getItem('token') || '' }
-}
-
-async function loadMe() {
-  try {
-    const res = await fetch('/api/me', { headers: authHeaders() })
-    const data = await res.json()
-    if (res.ok) {
-      username.value = data.username
-      avatar.value = data.avatar || ''
-      localStorage.setItem('username', data.username)
-    }
-  } catch (e) {
-    // ignore
-  }
-}
+const unread = ref(false)
+const hunter = useHunterStore()
+const user = useUserStore()
 
 function toggleMenu() {
   menuOpen.value = !menuOpen.value
@@ -39,12 +22,42 @@ function userInfo() {
 }
 
 function logout() {
-  localStorage.removeItem('token')
-  localStorage.removeItem('username')
+  user.logout()
   router.push('/login')
 }
 
-onMounted(loadMe)
+async function checkUnread() {
+  try {
+    const res = await fetch('/api/me/notifications', { headers: user.authHeaders() })
+    const data = await res.json()
+    if (!res.ok || !data.length) {
+      unread.value = false
+      return
+    }
+    const latest = data[0].created_at
+    const lastRead = localStorage.getItem('lastNotifAt') || ''
+    unread.value = latest > lastRead
+  } catch (e) {
+    unread.value = false
+  }
+}
+
+function markRead() {
+  unread.value = false
+}
+
+let unreadTimer = null
+
+onMounted(() => {
+  user.fetchMe()
+  checkUnread()
+  unreadTimer = setInterval(checkUnread, 15000)
+  hunter.load()
+})
+
+onBeforeUnmount(() => {
+  if (unreadTimer) clearInterval(unreadTimer)
+})
 </script>
 
 <template>
@@ -64,19 +77,45 @@ onMounted(loadMe)
           to="/messages"
           class="topnav-item"
           :class="{ active: route.path.startsWith('/messages') }"
+          @click="markRead"
         >
           消息
+          <span v-if="unread" class="dot"></span>
+        </router-link>
+        <router-link
+          v-if="user.isAdmin"
+          to="/admin"
+          class="topnav-item"
+          :class="{ active: route.path.startsWith('/admin') }"
+        >
+          管理
         </router-link>
       </nav>
+
+      <button
+        v-if="hunter.unlocked"
+        class="hunter-entry"
+        title="Hunter"
+        @click="router.push('/hunter')"
+      >
+        <svg viewBox="0 0 24 24" fill="none">
+          <path
+            d="M12 2 C6 5 4.5 10 6 14 C7 17 9 18.5 12 20 C15 18.5 17 17 18 14 C19.5 10 18 5 12 2 Z"
+            fill="#e5484d"
+          />
+          <path d="M9.5 20 L10.3 22 M14.5 20 L13.7 22" stroke="#7c5c3a" stroke-width="1" />
+          <rect x="8.5" y="20.4" width="7" height="3" rx="0.5" fill="#8a5a2b" />
+        </svg>
+      </button>
 
       <div class="spacer"></div>
 
       <div class="user">
         <div class="avatar" @click="toggleMenu">
-          <img v-if="avatar" :src="avatar" alt="" />
-          <span v-else>{{ initial }}</span>
+          <img v-if="user.avatar" :src="user.avatar" alt="" />
+          <span v-else>{{ user.initial }}</span>
         </div>
-        <span class="uname">{{ username }}</span>
+        <span class="uname">{{ user.username }}</span>
         <div v-if="menuOpen" class="dropdown">
           <button class="dd-item" @click="userInfo">用户信息</button>
           <button class="dd-item danger" @click="logout">退出登录</button>
@@ -127,6 +166,7 @@ onMounted(loadMe)
 }
 
 .topnav-item {
+  position: relative;
   padding: 8px 16px;
   border: none;
   background: transparent;
@@ -137,6 +177,16 @@ onMounted(loadMe)
   cursor: pointer;
   text-decoration: none;
   transition: all 0.15s;
+}
+
+.dot {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #ef4444;
 }
 
 .topnav-item:hover {
@@ -156,6 +206,28 @@ onMounted(loadMe)
 
 .spacer {
   flex: 1;
+}
+
+.hunter-entry {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  border: none;
+  background: transparent;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.hunter-entry:hover {
+  background: #f4f5fb;
+}
+
+.hunter-entry svg {
+  width: 22px;
+  height: 22px;
 }
 
 .user {
@@ -232,5 +304,39 @@ onMounted(loadMe)
 
 .content {
   min-width: 0;
+}
+
+@media (max-width: 768px) {
+  .topbar {
+    gap: 10px;
+    padding: 0 12px;
+    height: 54px;
+  }
+  .brand {
+    font-size: 16px;
+  }
+  .topnav {
+    gap: 2px;
+  }
+  .topnav-item {
+    padding: 6px 9px;
+    font-size: 13px;
+  }
+  .uname {
+    display: none;
+  }
+  .avatar {
+    width: 32px;
+    height: 32px;
+    font-size: 14px;
+  }
+  .hunter-entry {
+    width: 34px;
+    height: 34px;
+  }
+  .hunter-entry svg {
+    width: 20px;
+    height: 20px;
+  }
 }
 </style>

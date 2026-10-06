@@ -3,12 +3,16 @@ import { ref, computed, onMounted, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import QRCode from 'qrcode'
 import html2canvas from 'html2canvas'
+import { useHunterStore } from '../stores/hunter.js'
+import { useUserStore } from '../stores/user.js'
 
 const router = useRouter()
+const user = useUserStore()
 
 const mine = ref([])
 const actions = ref([])
 const loading = ref(true)
+const loadError = ref('')
 
 const usageData = ref([])
 const usageFilter = ref('all')
@@ -108,13 +112,52 @@ const shareLink = computed(() =>
   shareTarget.value ? window.location.origin + '/fill/' + shareTarget.value.id : ''
 )
 
+// 数据分析
+const statsTarget = ref(null)
+const statsData = ref(null)
+const statsLoading = ref(false)
+
+const PALETTE = [
+  '#6366f1', '#8b5cf6', '#ec4899', '#f59e0b', '#10b981',
+  '#06b6d4', '#f43f5e', '#84cc16', '#f97316', '#14b8a6',
+]
+
+function pct(count, total) {
+  if (!total) return 0
+  return Math.round((count / total) * 100)
+}
+
+function pieGradient(s) {
+  const total = s.total || 0
+  if (!total) return 'conic-gradient(#e5e7eb 0 100%)'
+  let acc = 0
+  const parts = s.items.map((o, i) => {
+    const start = (acc / total) * 100
+    acc += o.count
+    const end = (acc / total) * 100
+    return `${PALETTE[i % PALETTE.length]} ${start}% ${end}%`
+  })
+  return `conic-gradient(${parts.join(', ')})`
+}
+
+async function openStats(q) {
+  statsTarget.value = q
+  statsData.value = null
+  statsLoading.value = true
+  const res = await fetch(`/api/questionnaires/${q.id}/stats`, { headers: user.authHeaders() })
+  const data = await res.json()
+  statsLoading.value = false
+  if (res.ok) {
+    statsData.value = data
+  } else {
+    alert(data.error || '获取数据失败')
+    statsTarget.value = null
+  }
+}
+
 // 删除问卷
 const deleteTarget = ref(null)
 const deleting = ref(false)
-
-function authHeaders() {
-  return { Authorization: localStorage.getItem('token') || '' }
-}
 
 function formatTime(s) {
   if (!s) return '—'
@@ -126,25 +169,40 @@ function formatTime(s) {
 }
 
 async function load() {
-  const mineRes = await fetch('/api/questionnaires/mine', {
-    headers: authHeaders(),
-  })
-  const mineData = await mineRes.json()
-  if (mineRes.ok) mine.value = mineData
+  try {
+    const mineRes = await fetch('/api/questionnaires/mine', {
+      headers: user.authHeaders(),
+    })
+    const mineData = await mineRes.json()
+    if (mineRes.ok) {
+      mine.value = mineData
+      const published = mineData.some((q) => q.status === 'published')
+      hunter.load()
+      showPullTab.value = published && !hunter.deleted && !hunter.solved
 
-  const actionsRes = await fetch('/api/me/actions', {
-    headers: authHeaders(),
-  })
-  const actionsData = await actionsRes.json()
-  if (actionsRes.ok) actions.value = actionsData
+      if (showPullTab.value && hunter.hasValidSeq) {
+        noteNumsFromSeq(hunter.seq)
+        reveal.value = NOTE_W
+        noteOpen.value = true
+      }
+    }
 
-  const usageRes = await fetch('/api/me/responses', {
-    headers: authHeaders(),
-  })
-  const usageDataRes = await usageRes.json()
-  if (usageRes.ok) usageData.value = usageDataRes
+    const actionsRes = await fetch('/api/me/actions', {
+      headers: user.authHeaders(),
+    })
+    const actionsData = await actionsRes.json()
+    if (actionsRes.ok) actions.value = actionsData
 
-  loading.value = false
+    const usageRes = await fetch('/api/me/responses', {
+      headers: user.authHeaders(),
+    })
+    const usageDataRes = await usageRes.json()
+    if (usageRes.ok) usageData.value = usageDataRes
+  } catch (e) {
+    loadError.value = '连接后端失败，请确认已启动 backend/dev.bat'
+  } finally {
+    loading.value = false
+  }
 }
 
 function pickType(t) {
@@ -163,7 +221,7 @@ async function create() {
   creating.value = true
   const res = await fetch('/api/questionnaires', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    headers: { 'Content-Type': 'application/json', ...user.authHeaders() },
     body: JSON.stringify({
       type: newType.value,
       title: newTitle.value,
@@ -244,7 +302,7 @@ async function confirmDeleteResp() {
   deletingResp.value = true
   const res = await fetch(`/api/responses/${t.r.id}`, {
     method: 'DELETE',
-    headers: authHeaders(),
+    headers: user.authHeaders(),
   })
   deletingResp.value = false
   if (res.ok) {
@@ -289,7 +347,7 @@ async function toggleStatus(q) {
   const target = q.status === 'published' ? 'stopped' : 'published'
   const res = await fetch(`/api/questionnaires/${q.id}/status`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    headers: { 'Content-Type': 'application/json', ...user.authHeaders() },
     body: JSON.stringify({ status: target }),
   })
   const data = await res.json()
@@ -310,7 +368,7 @@ async function confirmDelete() {
   deleting.value = true
   const res = await fetch(`/api/questionnaires/${q.id}`, {
     method: 'DELETE',
-    headers: authHeaders(),
+    headers: user.authHeaders(),
   })
   deleting.value = false
   if (res.ok) {
@@ -319,6 +377,106 @@ async function confirmDelete() {
   } else {
     alert('删除失败')
   }
+}
+
+// —— 猎人彩蛋：拉条 + 纸条 ——
+const hunter = useHunterStore()
+const showPullTab = ref(false)
+const reveal = ref(0)
+const noteOpen = ref(false)
+const dragging = ref(false)
+const achievement = ref(false)
+const noteNums = ref([])
+const contextMenu = ref(false)
+const menuX = ref(0)
+const menuY = ref(0)
+const confirmDeleteNote = ref(false)
+const NOTE_W = 280
+
+let dragStartX = 0
+let dragStartReveal = 0
+
+function shuffledNums() {
+  const arr = [1, 2, 3, 4, 5]
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1))
+    ;[arr[i], arr[j]] = [arr[j], arr[i]]
+  }
+  return arr
+}
+
+function noteNumsFromSeq(seq) {
+  noteNums.value = seq.split('').map((ch, i) => ({
+    n: Number(ch),
+    left: 12 + i * 19,
+    top: 44 + (Math.random() * 22 - 11),
+    rot: -14 + Math.random() * 28,
+  }))
+}
+
+function buildNoteNums() {
+  noteNumsFromSeq(shuffledNums().join(''))
+}
+
+function onTabDown(e) {
+  if (e.button !== 0) return
+  dragging.value = true
+  dragStartX = e.clientX
+  dragStartReveal = reveal.value
+  if (noteNums.value.length === 0) {
+    if (hunter.hasValidSeq) noteNumsFromSeq(hunter.seq)
+    else buildNoteNums()
+  }
+  if (e.currentTarget && e.currentTarget.setPointerCapture) {
+    e.currentTarget.setPointerCapture(e.pointerId)
+  }
+}
+
+function onTabMove(e) {
+  if (!dragging.value) return
+  const dx = dragStartX - e.clientX
+  reveal.value = Math.max(0, Math.min(NOTE_W, dragStartReveal + dx))
+}
+
+function onTabUp() {
+  if (!dragging.value) return
+  dragging.value = false
+  if (reveal.value >= NOTE_W * 0.8) {
+    reveal.value = NOTE_W
+    noteOpen.value = true
+    const alreadySeen = !!hunter.seq
+    hunter.setSeq(noteNums.value.map((x) => x.n).join(''))
+    if (!alreadySeen) {
+      setTimeout(() => {
+        achievement.value = true
+      }, 350)
+    }
+  } else {
+    reveal.value = 0
+    noteOpen.value = false
+  }
+}
+
+function closeAchievement() {
+  achievement.value = false
+}
+
+function openContextMenu(e) {
+  contextMenu.value = true
+  menuX.value = e.clientX
+  menuY.value = e.clientY
+}
+
+function askDeleteNote() {
+  contextMenu.value = false
+  confirmDeleteNote.value = true
+}
+
+function doDeleteNote() {
+  hunter.setDeleted()
+  confirmDeleteNote.value = false
+  showPullTab.value = false
+  reveal.value = 0
 }
 
 onMounted(load)
@@ -349,6 +507,7 @@ onMounted(load)
       </header>
 
       <div v-if="loading" class="hint">加载中...</div>
+      <div v-else-if="loadError" class="hint error">{{ loadError }}</div>
 
       <template v-else-if="activeSection === 'created'">
         <div class="toolbar">
@@ -402,6 +561,7 @@ onMounted(load)
               <div class="actions">
                 <button class="act" @click="edit(q)">编辑</button>
                 <button class="act" @click="openShare(q)">分享</button>
+                <button class="act" @click="openStats(q)">数据分析</button>
               </div>
               <div class="right-actions">
                 <button
@@ -533,6 +693,30 @@ onMounted(load)
       </div>
     </div>
 
+    <!-- 数据分析弹窗 -->
+    <div v-if="statsTarget" class="mask" @click.self="statsTarget = null">
+      <div class="stats-modal">
+        <h3>数据分析</h3>
+        <p class="stats-title">{{ statsTarget.title }}</p>
+        <div v-if="statsLoading" class="hint">加载中...</div>
+        <div v-else-if="statsData && statsData.items && statsData.items.length" class="stats-body">
+          <div class="pie" :style="{ background: pieGradient(statsData) }"></div>
+          <div class="legend">
+            <div v-for="(o, oi) in statsData.items" :key="oi" class="legend-item">
+              <span class="lg-dot" :style="{ background: PALETTE[oi % PALETTE.length] }"></span>
+              <span class="lg-text">{{ o.label }}</span>
+              <span class="lg-pct">{{ pct(o.count, statsData.total) }}%</span>
+              <span class="lg-count">({{ o.count }})</span>
+            </div>
+          </div>
+        </div>
+        <div v-else class="hint">暂无答题数据</div>
+        <div class="stats-actions">
+          <button class="ghost" @click="statsTarget = null">关闭</button>
+        </div>
+      </div>
+    </div>
+
     <!-- 删除弹窗 -->
     <div v-if="deleteTarget" class="mask" @click.self="deleteTarget = null">
       <div class="confirm-modal">
@@ -578,6 +762,60 @@ onMounted(load)
           <div v-if="dl.type === 'exam'" class="dl-result">满分 {{ dl.full_score }} 分</div>
           <div v-else class="dl-result" v-html="dl.result_text"></div>
           <div class="dl-time">{{ formatTime(dl.created_at) }}</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 猎人彩蛋：隐藏拉条 -->
+    <div v-if="showPullTab" class="hunter" :class="{ open: noteOpen }">
+      <div class="note-wrap" :class="{ 'no-anim': dragging }" :style="{ width: reveal + 'px' }">
+        <div class="note">
+          <span
+            v-for="(item, i) in noteNums"
+            :key="i"
+            class="num"
+            :style="{ left: item.left + '%', top: item.top + '%', transform: `rotate(${item.rot}deg)` }"
+          >{{ item.n }}</span>
+        </div>
+      </div>
+      <div
+        class="handle"
+        @pointerdown="onTabDown"
+        @pointermove="onTabMove"
+        @pointerup="onTabUp"
+        @pointercancel="onTabUp"
+        @contextmenu.prevent="openContextMenu"
+      >
+        <span class="grip"></span>
+        <span class="grip"></span>
+        <span class="grip"></span>
+      </div>
+    </div>
+
+    <!-- 成就弹窗 -->
+    <div v-if="achievement" class="hunter-mask" @click.self="closeAchievement">
+      <div class="achieve-paper">
+        <div class="achieve-title">✦ 成就解锁 ✦</div>
+        <div class="achieve-text">你发现了一些不同寻常的东西！</div>
+        <button class="achieve-btn" @click="closeAchievement">知道了</button>
+      </div>
+    </div>
+
+    <!-- 右键菜单 -->
+    <div v-if="contextMenu" class="hunter-menu-backdrop" @click="contextMenu = false">
+      <div class="hunter-menu" :style="{ left: menuX + 'px', top: menuY + 'px' }" @click.stop>
+        <button class="menu-item danger" @click="askDeleteNote">永久删除纸条</button>
+      </div>
+    </div>
+
+    <!-- 删除确认 -->
+    <div v-if="confirmDeleteNote" class="hunter-mask" @click.self="confirmDeleteNote = false">
+      <div class="achieve-paper">
+        <div class="achieve-title">删除纸条</div>
+        <div class="achieve-text confirm">确定要永久删除这张纸条吗？删除后无法恢复。</div>
+        <div class="achieve-actions">
+          <button class="achieve-btn ghost" @click="confirmDeleteNote = false">取消</button>
+          <button class="achieve-btn danger" @click="doDeleteNote">删除</button>
         </div>
       </div>
     </div>
@@ -904,6 +1142,10 @@ onMounted(load)
   text-align: center;
 }
 
+.hint.error {
+  color: var(--danger);
+}
+
 .mask {
   position: fixed;
   inset: 0;
@@ -1175,6 +1417,89 @@ onMounted(load)
   font-size: 13px;
 }
 
+.stats-modal {
+  width: 100%;
+  max-width: 640px;
+  max-height: 82vh;
+  overflow-y: auto;
+  background: #fff;
+  border-radius: 20px;
+  padding: 28px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.2);
+}
+
+.stats-modal h3 {
+  margin: 0 0 6px;
+  font-size: 20px;
+}
+
+.stats-title {
+  color: var(--muted);
+  font-size: 14px;
+  margin: 0 0 20px;
+}
+
+.stats-body {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+}
+
+.pie {
+  width: 120px;
+  height: 120px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.legend {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.lg-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.lg-text {
+  flex: 1;
+  min-width: 0;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lg-pct {
+  font-weight: 600;
+  color: var(--text);
+  flex-shrink: 0;
+}
+
+.lg-count {
+  color: #94a3b8;
+  flex-shrink: 0;
+}
+
+.stats-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 20px;
+}
+
 .confirm-modal {
   width: 100%;
   max-width: 400px;
@@ -1345,5 +1670,262 @@ onMounted(load)
 .dl-time {
   font-size: 12px;
   color: #9ca3af;
+}
+
+/* —— 猎人彩蛋：拉条 + 纸条 —— */
+.hunter {
+  position: fixed;
+  top: 50%;
+  right: 0;
+  z-index: 400;
+  display: flex;
+  align-items: center;
+  transform: translateY(-50%);
+}
+
+.hunter.open {
+  flex-direction: row-reverse;
+}
+
+.note-wrap {
+  position: relative;
+  height: 360px;
+  overflow: hidden;
+  transition: width 0.28s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.note-wrap.no-anim {
+  transition: none;
+}
+
+.note {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 280px;
+  height: 360px;
+  box-sizing: border-box;
+  padding: 26px 18px;
+  background-color: #f6edd8;
+  background-image: repeating-linear-gradient(
+    transparent,
+    transparent 31px,
+    rgba(120, 90, 50, 0.14) 32px
+  );
+  box-shadow: inset 0 0 26px rgba(0, 0, 0, 0.08);
+}
+
+.note::before {
+  content: '';
+  position: absolute;
+  inset: 10px;
+  border: 2px dashed rgba(120, 90, 50, 0.35);
+  border-radius: 8px;
+  pointer-events: none;
+}
+
+.num {
+  position: absolute;
+  font-family: 'KaiTi', 'STKaiti', 'DFKai-SB', 'Segoe Print', 'Comic Sans MS', cursive;
+  font-size: 36px;
+  font-weight: 700;
+  color: #4a3728;
+  line-height: 1;
+}
+
+.handle {
+  position: relative;
+  width: 30px;
+  height: 96px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  background: linear-gradient(160deg, #f9f2e3, #eadfc7);
+  border: 1px solid rgba(120, 90, 50, 0.4);
+  border-radius: 15px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.12);
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.handle:active {
+  cursor: grabbing;
+}
+
+.grip {
+  width: 16px;
+  height: 3px;
+  border-radius: 2px;
+  background: rgba(120, 90, 50, 0.5);
+}
+
+.hunter-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 500;
+  background: rgba(40, 30, 20, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
+.achieve-paper {
+  position: relative;
+  width: 100%;
+  max-width: 360px;
+  background: #f6edd8;
+  border-radius: 12px;
+  padding: 40px 28px 30px;
+  text-align: center;
+  transform: rotate(-1deg);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3), inset 0 0 26px rgba(0, 0, 0, 0.08);
+  font-family: 'KaiTi', 'STKaiti', 'DFKai-SB', 'Segoe Print', 'Comic Sans MS', cursive;
+}
+
+.achieve-paper::before {
+  content: '';
+  position: absolute;
+  inset: 10px;
+  border: 2px dashed rgba(120, 90, 50, 0.35);
+  border-radius: 8px;
+  pointer-events: none;
+}
+
+.achieve-title {
+  font-size: 18px;
+  color: #a16207;
+  margin-bottom: 16px;
+}
+
+.achieve-text {
+  font-size: 24px;
+  font-weight: 700;
+  color: #4a3728;
+  line-height: 1.5;
+  margin-bottom: 26px;
+}
+
+.achieve-btn {
+  padding: 10px 28px;
+  font-family: inherit;
+  font-size: 16px;
+  font-weight: 700;
+  color: #4a3728;
+  background: #f0e3c8;
+  border: 2px solid rgba(120, 90, 50, 0.5);
+  border-radius: 10px;
+  cursor: pointer;
+}
+
+.achieve-btn:hover {
+  background: #e9d9b6;
+}
+
+.hunter-menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 450;
+}
+
+.hunter-menu {
+  position: fixed;
+  min-width: 140px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.14);
+  padding: 6px;
+  z-index: 451;
+}
+
+.menu-item {
+  width: 100%;
+  padding: 9px 12px;
+  border: none;
+  background: transparent;
+  text-align: left;
+  font-size: 14px;
+  color: var(--text);
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.menu-item:hover {
+  background: #f4f5fb;
+}
+
+.menu-item.danger {
+  color: var(--danger);
+}
+
+.menu-item.danger:hover {
+  background: rgba(239, 68, 68, 0.06);
+}
+
+.achieve-actions {
+  display: flex;
+  justify-content: center;
+  gap: 12px;
+}
+
+.achieve-text.confirm {
+  font-size: 17px;
+}
+
+.achieve-btn.ghost {
+  background: #f6edd8;
+}
+
+.achieve-btn.ghost:hover {
+  background: #e9d9b6;
+}
+
+.achieve-btn.danger {
+  background: #ef4444;
+  border-color: #dc2626;
+  color: #fff;
+}
+
+.achieve-btn.danger:hover {
+  background: #dc2626;
+}
+
+@media (max-width: 768px) {
+  .mine {
+    flex-direction: column;
+  }
+  .sidebar {
+    width: 100%;
+    flex-shrink: 1;
+    padding: 12px 16px;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+    flex-direction: row;
+    align-items: center;
+    gap: 12px;
+  }
+  .new-btn {
+    padding: 10px 16px;
+    font-size: 14px;
+    white-space: nowrap;
+  }
+  .side-nav {
+    flex-direction: row;
+    gap: 4px;
+    flex: 1;
+    overflow-x: auto;
+  }
+  .side-item {
+    padding: 9px 12px;
+    white-space: nowrap;
+  }
+  .main {
+    padding: 20px 16px;
+  }
 }
 </style>

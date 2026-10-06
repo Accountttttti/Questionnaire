@@ -1,12 +1,50 @@
 <script setup>
-import { ref, onUnmounted } from 'vue'
+import { ref, watch, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
+import { useUserStore } from '../stores/user.js'
 
 const router = useRouter()
+const user = useUserStore()
 const username = ref('')
 const password = ref('')
 const error = ref('')
 const mode = ref('login')
+const rememberUser = ref(false)
+const rememberPwd = ref(false)
+
+const usernameError = ref('')
+const passwordError = ref('')
+
+const USERNAME_RE = /^[一-龥A-Za-z0-9]{2,20}$/
+
+function usernameRule(v) {
+  const s = (v || '').trim()
+  if (!USERNAME_RE.test(s)) return '用户名需为 2-20 个汉字、字母或数字'
+  return ''
+}
+
+function passwordRule(v) {
+  const s = v || ''
+  if (s.length < 6 || s.length > 32) return '密码需为 6-32 个字符'
+  if (!/[A-Za-z]/.test(s) || !/\d/.test(s)) return '密码需同时包含字母和数字'
+  return ''
+}
+
+watch(username, (v) => {
+  if (mode.value !== 'register') return
+  usernameError.value = v.trim() ? usernameRule(v) : ''
+})
+
+watch(password, (v) => {
+  if (mode.value !== 'register') return
+  passwordError.value = v ? passwordRule(v) : ''
+})
+
+watch(mode, () => {
+  usernameError.value = ''
+  passwordError.value = ''
+  error.value = ''
+})
 
 // 忘记密码
 const showForgot = ref(false)
@@ -19,10 +57,58 @@ const resetting = ref(false)
 const cooldown = ref(0)
 const forgotMsg = ref('')
 const forgotError = ref('')
+const forgotPwdError = ref('')
 let forgotTimer = null
+
+watch(newPassword, (v) => {
+  forgotPwdError.value = v ? passwordRule(v) : ''
+})
+
+function saveRemember() {
+  localStorage.setItem('remember_user', rememberUser.value ? '1' : '0')
+  localStorage.setItem('remember_pwd', rememberPwd.value ? '1' : '0')
+  if (rememberUser.value || rememberPwd.value) {
+    localStorage.setItem('saved_username', username.value)
+  } else {
+    localStorage.removeItem('saved_username')
+  }
+  if (rememberPwd.value) {
+    localStorage.setItem('saved_password', password.value)
+  } else {
+    localStorage.removeItem('saved_password')
+  }
+}
+
+function restoreRemember() {
+  if (localStorage.getItem('remember_user') === '1') {
+    rememberUser.value = true
+    username.value = localStorage.getItem('saved_username') || ''
+  }
+  if (localStorage.getItem('remember_pwd') === '1') {
+    rememberPwd.value = true
+    rememberUser.value = true
+    username.value = localStorage.getItem('saved_username') || ''
+    password.value = localStorage.getItem('saved_password') || ''
+  }
+}
+
+onMounted(restoreRemember)
 
 async function submit() {
   error.value = ''
+  if (mode.value === 'register') {
+    if (!username.value.trim()) {
+      usernameError.value = '请输入用户名'
+      return
+    }
+    if (!password.value) {
+      passwordError.value = '请输入密码'
+      return
+    }
+    usernameError.value = usernameRule(username.value)
+    passwordError.value = passwordRule(password.value)
+    if (usernameError.value || passwordError.value) return
+  }
   const res = await fetch(`/api/${mode.value}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -33,8 +119,8 @@ async function submit() {
     error.value = data.error || '出错了'
     return
   }
-  localStorage.setItem('token', data.token)
-  localStorage.setItem('username', data.username)
+  user.setAuth(data.token, data.username)
+  if (mode.value === 'login') saveRemember()
   router.push('/')
 }
 
@@ -88,6 +174,11 @@ async function resetPassword() {
     forgotError.value = '请输入新密码'
     return
   }
+  forgotPwdError.value = passwordRule(newPassword.value)
+  if (forgotPwdError.value) {
+    forgotError.value = forgotPwdError.value
+    return
+  }
   resetting.value = true
   forgotMsg.value = ''
   forgotError.value = ''
@@ -129,8 +220,35 @@ onUnmounted(() => {
       </div>
 
       <div class="fields">
-        <input v-model="username" placeholder="用户名" />
-        <input v-model="password" type="password" placeholder="密码" @keyup.enter="submit" />
+        <div class="field-box">
+          <input
+            v-model="username"
+            placeholder="用户名"
+            :class="{ invalid: usernameError }"
+          />
+          <p v-if="usernameError" class="field-error">{{ usernameError }}</p>
+        </div>
+        <div class="field-box">
+          <input
+            v-model="password"
+            type="password"
+            placeholder="密码"
+            :class="{ invalid: passwordError }"
+            @keyup.enter="submit"
+          />
+          <p v-if="passwordError" class="field-error">{{ passwordError }}</p>
+        </div>
+      </div>
+
+      <div v-if="mode === 'login'" class="remember">
+        <label class="remember-item">
+          <input type="checkbox" v-model="rememberUser" />
+          <span>记住用户名</span>
+        </label>
+        <label class="remember-item">
+          <input type="checkbox" v-model="rememberPwd" />
+          <span>记住密码</span>
+        </label>
       </div>
 
       <p v-if="error" class="error">{{ error }}</p>
@@ -162,7 +280,13 @@ onUnmounted(() => {
 
         <div v-if="codeSent" class="field">
           <label>新密码</label>
-          <input v-model="newPassword" type="password" placeholder="设置新密码" />
+          <input
+            v-model="newPassword"
+            type="password"
+            placeholder="6-32 位，含字母和数字"
+            :class="{ invalid: forgotPwdError }"
+          />
+          <p v-if="forgotPwdError" class="field-error">{{ forgotPwdError }}</p>
         </div>
 
         <p v-if="forgotError" class="msg error">{{ forgotError }}</p>
@@ -261,11 +385,61 @@ onUnmounted(() => {
   box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.15);
 }
 
+.field-box {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.fields input.invalid,
+.field input.invalid {
+  border-color: #ef4444;
+}
+
+.fields input.invalid:focus,
+.field input.invalid:focus {
+  border-color: #ef4444;
+  box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.15);
+}
+
+.field-error {
+  color: #ef4444;
+  font-size: 12px;
+  margin: 0;
+  text-align: left;
+}
+
 .error {
   color: #ef4444;
   font-size: 13px;
   margin: 10px 0 0;
   text-align: left;
+}
+
+.remember {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  margin-top: 16px;
+  text-align: left;
+}
+
+.remember-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+.remember-item input {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  accent-color: #6366f1;
+  cursor: pointer;
 }
 
 .submit {

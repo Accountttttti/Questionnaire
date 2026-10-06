@@ -1,10 +1,12 @@
 <script setup>
 import { ref, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { useUserStore } from '../stores/user.js'
 
 const route = useRoute()
 const router = useRouter()
 const qid = route.params.id
+const user = useUserStore()
 
 const q = ref(null)
 const error = ref('')
@@ -14,7 +16,7 @@ const typeLabel = { test: '测试问卷', relay: '接龙', exam: '考试' }
 
 async function load() {
   const res = await fetch(`/api/questionnaires/${qid}/public`, {
-    headers: { Authorization: localStorage.getItem('token') || '' },
+    headers: user.authHeaders(),
   })
   const data = await res.json()
   loading.value = false

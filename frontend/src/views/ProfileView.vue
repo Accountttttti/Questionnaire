@@ -1,7 +1,27 @@
 <script setup>
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, watch, onMounted, onUnmounted } from 'vue'
+import { useUserStore } from '../stores/user.js'
 
 const user = ref({ username: '', avatar: '', email: '' })
+const userStore = useUserStore()
+
+const USERNAME_RE = /^[一-龥A-Za-z0-9]{2,20}$/
+
+function usernameRule(v) {
+  const s = (v || '').trim()
+  if (!USERNAME_RE.test(s)) return '用户名需为 2-20 个汉字、字母或数字'
+  return ''
+}
+
+function passwordRule(v) {
+  const s = v || ''
+  if (s.length < 6 || s.length > 32) return '密码需为 6-32 个字符'
+  if (!/[A-Za-z]/.test(s) || !/\d/.test(s)) return '密码需同时包含字母和数字'
+  return ''
+}
+
+const usernameError = ref('')
+const newPwdError = ref('')
 
 const editUsername = ref('')
 const editAvatar = ref('')
@@ -25,12 +45,16 @@ const savingPwd = ref(false)
 const pwdMsg = ref('')
 const pwdError = ref('')
 
-function authHeaders() {
-  return { Authorization: localStorage.getItem('token') || '' }
-}
+watch(editUsername, (v) => {
+  usernameError.value = (v || '').trim() ? usernameRule(v) : ''
+})
+
+watch(newPassword, (v) => {
+  newPwdError.value = v ? passwordRule(v) : ''
+})
 
 async function load() {
-  const res = await fetch('/api/me', { headers: authHeaders() })
+  const res = await fetch('/api/me', { headers: userStore.authHeaders() })
   const data = await res.json()
   if (res.ok) {
     user.value = data
@@ -46,7 +70,7 @@ async function onPickAvatar(e) {
   fd.append('file', file)
   const res = await fetch('/api/upload', {
     method: 'POST',
-    headers: { Authorization: localStorage.getItem('token') || '' },
+    headers: userStore.authHeaders(),
     body: fd,
   })
   const data = await res.json()
@@ -58,18 +82,23 @@ async function onPickAvatar(e) {
 }
 
 async function saveProfile() {
-  savingProfile.value = true
   profileMsg.value = ''
   profileError.value = ''
+  if ((editUsername.value || '').trim()) {
+    usernameError.value = usernameRule(editUsername.value)
+    if (usernameError.value) return
+  }
+  savingProfile.value = true
   const res = await fetch('/api/me', {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    headers: { 'Content-Type': 'application/json', ...userStore.authHeaders() },
     body: JSON.stringify({ username: editUsername.value, avatar: editAvatar.value }),
   })
   const data = await res.json()
   savingProfile.value = false
   if (res.ok) {
     user.value = { ...user.value, ...data }
+    userStore.username = data.username
     localStorage.setItem('username', data.username)
     profileMsg.value = '保存成功'
   } else {
@@ -88,7 +117,7 @@ async function sendCode() {
   emailError.value = ''
   const res = await fetch('/api/me/email/send-code', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    headers: { 'Content-Type': 'application/json', ...userStore.authHeaders() },
     body: JSON.stringify({ email: emailInput.value.trim() }),
   })
   const data = await res.json()
@@ -117,7 +146,7 @@ async function verifyEmail() {
   emailError.value = ''
   const res = await fetch('/api/me/email/verify', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    headers: { 'Content-Type': 'application/json', ...userStore.authHeaders() },
     body: JSON.stringify({ email: emailInput.value.trim(), code: codeInput.value.trim() }),
   })
   const data = await res.json()
@@ -137,12 +166,17 @@ async function savePassword() {
     pwdError.value = '请填写旧密码和新密码'
     return
   }
+  newPwdError.value = passwordRule(newPassword.value)
+  if (newPwdError.value) {
+    pwdError.value = newPwdError.value
+    return
+  }
   savingPwd.value = true
   pwdMsg.value = ''
   pwdError.value = ''
   const res = await fetch('/api/me', {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    headers: { 'Content-Type': 'application/json', ...userStore.authHeaders() },
     body: JSON.stringify({ old_password: oldPassword.value, new_password: newPassword.value }),
   })
   const data = await res.json()
@@ -185,7 +219,12 @@ onUnmounted(() => {
 
       <div class="field">
         <label>昵称</label>
-        <input v-model="editUsername" placeholder="昵称" />
+        <input
+          v-model="editUsername"
+          placeholder="2-20 个汉字、字母或数字"
+          :class="{ invalid: usernameError }"
+        />
+        <p v-if="usernameError" class="field-error">{{ usernameError }}</p>
       </div>
 
       <div class="field">
@@ -243,7 +282,13 @@ onUnmounted(() => {
 
       <div class="field">
         <label>新密码</label>
-        <input v-model="newPassword" type="password" placeholder="新密码" />
+        <input
+          v-model="newPassword"
+          type="password"
+          placeholder="6-32 位，含字母和数字"
+          :class="{ invalid: newPwdError }"
+        />
+        <p v-if="newPwdError" class="field-error">{{ newPwdError }}</p>
       </div>
 
       <p v-if="pwdError" class="msg error">{{ pwdError }}</p>
@@ -363,6 +408,21 @@ onUnmounted(() => {
 .field input:focus {
   border-color: var(--primary);
   box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.12);
+}
+
+.field input.invalid {
+  border-color: var(--danger);
+}
+
+.field input.invalid:focus {
+  border-color: var(--danger);
+  box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.15);
+}
+
+.field-error {
+  color: var(--danger);
+  font-size: 12px;
+  margin: 6px 0 0;
 }
 
 .email-display {

@@ -1,9 +1,12 @@
 import io
 import json
+import re
 import secrets
 import smtplib
 import string
 import uuid
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 from email.header import Header
 from email.mime.text import MIMEText
 from email.utils import formataddr
@@ -26,6 +29,31 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 ALLOWED_IMAGE_EXT = {"png", "jpg", "jpeg", "gif", "webp"}
 
 
+def ensure_super_admin():
+    username = (getattr(config, "SUPER_ADMIN_USERNAME", "") or "").strip()
+    if not username:
+        return
+    password = getattr(config, "SUPER_ADMIN_PASSWORD", "") or "admin123456"
+    conn = get_db()
+    row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    if row:
+        if row["role"] != "super" or not check_password_hash(row["password_hash"], password):
+            conn.execute(
+                "UPDATE users SET role = 'super', password_hash = ? WHERE id = ?",
+                (generate_password_hash(password), row["id"]),
+            )
+    else:
+        conn.execute(
+            "INSERT INTO users (username, password_hash, token, role) VALUES (?, ?, ?, 'super')",
+            (username, generate_password_hash(password), secrets.token_hex(16)),
+        )
+    conn.commit()
+    conn.close()
+
+
+ensure_super_admin()
+
+
 def current_user():
     token = request.headers.get("Authorization", "")
     if not token:
@@ -34,6 +62,60 @@ def current_user():
     row = conn.execute("SELECT * FROM users WHERE token = ?", (token,)).fetchone()
     conn.close()
     return row
+
+
+def is_admin(user):
+    return user is not None and user["role"] in ("admin", "super")
+
+
+def is_super(user):
+    return user is not None and user["role"] == "super"
+
+
+USERNAME_RE = re.compile(r"[一-龥A-Za-z0-9]{2,20}")
+
+
+def validate_username(username):
+    if not USERNAME_RE.fullmatch(username):
+        return "用户名需为 2-20 个汉字、字母或数字"
+    return None
+
+
+def validate_password(password):
+    if len(password) < 6 or len(password) > 32:
+        return "密码需为 6-32 个字符"
+    if not re.search(r"[A-Za-z]", password) or not re.search(r"\d", password):
+        return "密码需同时包含字母和数字"
+    return None
+
+
+def find_blocked_words(*texts):
+    words = getattr(config, "BLOCKED_WORDS", []) or []
+    hits = []
+    for t in texts:
+        if not t:
+            continue
+        low = str(t).lower()
+        for w in words:
+            w = (w or "").strip()
+            if w and w.lower() in low and w not in hits:
+                hits.append(w)
+    return hits
+
+
+def scan_questionnaire(qid):
+    conn = get_db()
+    q = conn.execute("SELECT title, description FROM questionnaires WHERE id = ?", (qid,)).fetchone()
+    texts = [q["title"], q["description"]] if q else []
+    rows = conn.execute("SELECT title FROM questions WHERE questionnaire_id = ?", (qid,)).fetchall()
+    texts += [r["title"] for r in rows]
+    opts = conn.execute(
+        "SELECT text FROM options WHERE question_id IN (SELECT id FROM questions WHERE questionnaire_id = ?)",
+        (qid,),
+    ).fetchall()
+    texts += [r["text"] for r in opts]
+    conn.close()
+    return find_blocked_words(*texts)
 
 
 def send_verification_email(to_addr, code):
@@ -50,6 +132,107 @@ def send_verification_email(to_addr, code):
     server.quit()
 
 
+# 猎人密钥字母表：去掉易混淆的 I / O / 0 / 1
+HUNTER_KEY_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+def generate_hunter_key():
+    parts = [
+        "".join(secrets.choice(HUNTER_KEY_ALPHABET) for _ in range(4))
+        for _ in range(3)
+    ]
+    return "HT-" + "-".join(parts)
+
+
+def send_hunter_key_email(to_addr, key):
+    subject = "猎人协会 · 考前训练密钥"
+    body = (
+        "亲爱的准猎人：\n\n"
+        "猎人协会已受理您的第 289 届猎人资格考试报名申请，\n"
+        "并为您开通了「考前训练」秘密渠道。\n\n"
+        f"您的专属密钥如下：\n\n    {key}\n\n"
+        "使用方法：进入猎人协会首页，点击 H 徽章中央的红色菱形，\n"
+        "在弹出的窗口中输入上述密钥即可进入训练。\n\n"
+        "此密钥长期有效，请妥善保管，切勿泄露。\n\n"
+        "—— 猎人协会 · 本部"
+    )
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["Subject"] = Header(subject, "utf-8")
+    msg["From"] = formataddr((config.SMTP_FROM, config.SMTP_USER))
+    msg["To"] = to_addr
+
+    server = smtplib.SMTP_SSL(config.SMTP_HOST, config.SMTP_PORT)
+    server.login(config.SMTP_USER, config.SMTP_PASSWORD)
+    server.sendmail(config.SMTP_USER, [to_addr], msg.as_string())
+    server.quit()
+
+
+@app.route("/api/hunter/key", methods=["POST"])
+def hunter_key():
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip()
+    classification = (data.get("classification") or "").strip()
+    if not email or "@" not in email:
+        return jsonify({"error": "邮箱格式不正确"}), 400
+
+    if not config.SMTP_USER or not config.SMTP_PASSWORD:
+        return jsonify({"error": "SMTP 未配置，请在 config.py 中填写邮箱和授权码"}), 500
+
+    conn = get_db()
+    row = conn.execute("SELECT * FROM hunter_keys WHERE email = ?", (email,)).fetchone()
+    if row:
+        key = row["key"]
+    else:
+        key = generate_hunter_key()
+        conn.execute("INSERT INTO hunter_keys (email, key) VALUES (?, ?)", (email, key))
+
+    app_row = conn.execute(
+        "SELECT id FROM hunter_applications WHERE email = ?", (email,)
+    ).fetchone()
+    if app_row:
+        conn.execute(
+            "UPDATE hunter_applications SET classification = ? WHERE email = ?",
+            (classification, email),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO hunter_applications (email, classification) VALUES (?, ?)",
+            (email, classification),
+        )
+    conn.commit()
+    conn.close()
+
+    try:
+        send_hunter_key_email(email, key)
+    except Exception as e:
+        return jsonify({"error": f"邮件发送失败：{e}"}), 500
+
+    return jsonify({"ok": True})
+
+
+@app.route("/api/hunter/train/verify", methods=["POST"])
+def hunter_train_verify():
+    data = request.get_json(silent=True) or {}
+    key = (data.get("key") or "").strip().upper()
+
+    conn = get_db()
+    row = conn.execute("SELECT * FROM hunter_keys WHERE key = ?", (key,)).fetchone()
+    if row is None:
+        conn.close()
+        return jsonify({"error": "密钥无效，请检查后重试"}), 400
+
+    app_row = conn.execute(
+        "SELECT classification FROM hunter_applications WHERE email = ?",
+        (row["email"],),
+    ).fetchone()
+    conn.close()
+
+    return jsonify({
+        "ok": True,
+        "classification": app_row["classification"] if app_row else "",
+    })
+
+
 @app.route("/api/register", methods=["POST"])
 def register():
     data = request.get_json(silent=True) or {}
@@ -59,8 +242,21 @@ def register():
     if not username or not password:
         return jsonify({"error": "用户名和密码不能为空"}), 400
 
+    err = validate_username(username)
+    if err:
+        return jsonify({"error": err}), 400
+    err = validate_password(password)
+    if err:
+        return jsonify({"error": err}), 400
+
+    super_name = (getattr(config, "SUPER_ADMIN_USERNAME", "") or "").strip()
+    if super_name and username.lower() == super_name.lower():
+        return jsonify({"error": "该用户名已被保留"}), 400
+
     conn = get_db()
-    exists = conn.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()
+    exists = conn.execute(
+        "SELECT id FROM users WHERE LOWER(username) = LOWER(?)", (username,)
+    ).fetchone()
     if exists:
         conn.close()
         return jsonify({"error": "用户名已存在"}), 400
@@ -83,7 +279,7 @@ def login():
     password = data.get("password") or ""
 
     conn = get_db()
-    row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    row = conn.execute("SELECT * FROM users WHERE LOWER(username) = LOWER(?)", (username,)).fetchone()
     conn.close()
 
     if row is None or not check_password_hash(row["password_hash"], password):
@@ -104,8 +300,12 @@ def me():
 
         username = (data.get("username") or "").strip()
         if username and username != user["username"]:
+            err = validate_username(username)
+            if err:
+                conn.close()
+                return jsonify({"error": err}), 400
             exists = conn.execute(
-                "SELECT id FROM users WHERE username = ? AND id != ?",
+                "SELECT id FROM users WHERE LOWER(username) = LOWER(?) AND id != ?",
                 (username, user["id"]),
             ).fetchone()
             if exists:
@@ -127,6 +327,10 @@ def me():
 
         new_password = data.get("new_password")
         if new_password:
+            err = validate_password(new_password)
+            if err:
+                conn.close()
+                return jsonify({"error": err}), 400
             old_password = data.get("old_password") or ""
             if not check_password_hash(user["password_hash"], old_password):
                 conn.close()
@@ -145,6 +349,7 @@ def me():
             "avatar": row["avatar"],
             "email": row["email"],
             "phone": row["phone"],
+            "role": row["role"],
         })
 
     return jsonify({
@@ -153,6 +358,7 @@ def me():
         "avatar": user["avatar"],
         "email": user["email"],
         "phone": user["phone"],
+        "role": user["role"],
     })
 
 
@@ -194,6 +400,108 @@ EXAM_TYPE_MAP = {
     "判断": "judge", "判断题": "judge",
     "填空": "fill", "填空题": "fill",
 }
+
+# DeepSeek AI（每个用户自己填 API Key，这里只放服务地址和模型名）
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_MODEL = "deepseek-chat"
+
+EXAM_AI_SYSTEM = (
+    "你是考试出卷助手。根据用户的描述生成一套考试题目，只输出一个 json 对象，不要输出任何解释或额外文字。\n"
+    "json 结构必须严格为：\n"
+    '{"questions": [{"type": "single|multiple|judge|fill", "title": "题干", "score": 整数分值, '
+    '"options": [{"text": "选项文字", "is_correct": true或false}], "answer": "仅填空题填参考答案，多个用|分隔"}]}\n'
+    "规则：\n"
+    "1. type 只能是 single(单选)、multiple(多选)、judge(判断)、fill(填空) 之一。\n"
+    "2. single/multiple 必须含 options 数组，每项有 text 和 is_correct 布尔值；single 只能有一个 is_correct=true，multiple 可有多个。\n"
+    "3. judge 的 options 固定为 [{\"text\":\"对\",\"is_correct\":布尔},{\"text\":\"错\",\"is_correct\":布尔}]。\n"
+    "4. fill 不需要 options，用 answer 字段填参考答案，多个答案用 | 分隔。\n"
+    "5. score 为正整数，通常 5 分。题目数量遵循用户要求，默认 5 题。"
+)
+
+TEST_AI_SYSTEM = (
+    "你是问卷出卷助手。根据用户的描述生成一套测试问卷（含题目和结果卡片），只输出一个 json 对象，不要输出任何解释或额外文字。\n"
+    "json 结构必须严格为：\n"
+    '{"questions": [{"type": "single|scale", "title": "题干", "options": [{"text": "选项文字", "score": 整数分值}]}], '
+    '"result_cards": [{"min_score": 整数最低分, "max_score": 整数最高分, "text": "结果文案"}]}\n'
+    "规则：\n"
+    "1. type 只能是 single(单选题) 或 scale(量表题)。\n"
+    "2. single 的每个选项 score 为整数分值，可正可负；scale 的 options 固定为 "
+    "[{\"text\":\"完全不符合\",\"score\":1},{\"text\":\"不符合\",\"score\":2},{\"text\":\"中立\",\"score\":3},"
+    "{\"text\":\"符合\",\"score\":4},{\"text\":\"完全符合\",\"score\":5}]。\n"
+    "3. result_cards 的分数区间要覆盖所有可能得分、互不重叠，min_score<=max_score，text 是该分数段对应的结果文案。"
+)
+
+JUMP_AI_SYSTEM = (
+    "你是问卷出卷助手。根据用户的描述生成一套跳转式测试问卷（每题为单选题，通过选项跳转到下一题或直接跳到某个结果），只输出一个 json 对象，不要输出任何解释或额外文字。\n"
+    "json 结构必须严格为：\n"
+    '{"questions": [{"type": "single", "title": "题干", "options": [{"text": "选项文字", "jump_to": "跳转目标"}]}], '
+    '"result_cards": [{"label": "A|B|C...", "text": "结果文案"}]}\n'
+    "规则：\n"
+    "1. questions 只含 single 单选题。每个选项的 jump_to 表示选中该选项后跳转到的位置。\n"
+    "2. jump_to 取值：'qN' 表示跳到第 N 题（N 为正整数，从 1 开始）；'rX' 表示直接跳到结果 X（X 为 result_cards 里的 label，从 A 开始的大写字母）。\n"
+    "3. 只能向后跳：'qN' 的 N 必须大于当前题号，禁止跳回前面的题，避免循环。\n"
+    "4. 最后一题的每个选项必须用 'rX' 跳到某个结果，不能再跳题。\n"
+    "5. 每个结果（label）至少要被某个选项引用一次；除第 1 题外，每道题至少要被前面某题的选项通过 'qN' 引用到。\n"
+    "6. 整体像一棵从第 1 题出发、逐层分叉、最终落到结果的决策树。\n"
+    "7. result_cards 每个结果含 label（从 A 开始连续的大写字母）和 text（结果文案），数量通常 3~5 个。\n"
+    "8. 题目数量遵循用户要求，默认 5 题。"
+)
+
+
+def sanitize_jump(questions, result_cards):
+    labels = []
+    for c in result_cards or []:
+        if isinstance(c, dict):
+            lab = (c.get("label") or "").strip()
+            if lab:
+                labels.append(lab)
+    n = len(questions)
+    for i, q in enumerate(questions):
+        if not isinstance(q, dict):
+            continue
+        opts = q.get("options")
+        if not isinstance(opts, list):
+            continue
+        for o in opts:
+            if not isinstance(o, dict):
+                continue
+            jt = (o.get("jump_to") or "").strip()
+            valid = ""
+            if jt.startswith("q"):
+                try:
+                    num = int(jt[1:])
+                except ValueError:
+                    num = 0
+                # 1-based forward jump: num-1 must be after current index i
+                if 1 <= num <= n and num > i + 1:
+                    valid = "q" + str(num)
+            elif jt.startswith("r"):
+                if jt[1:] in labels:
+                    valid = "r" + jt[1:]
+            if not valid and i == n - 1 and labels:
+                valid = "r" + labels[0]
+            o["jump_to"] = valid
+
+
+def call_deepseek(api_key, system, prompt):
+    url = DEEPSEEK_BASE_URL.rstrip("/") + "/chat/completions"
+    payload = {
+        "model": DEEPSEEK_MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.7,
+        "response_format": {"type": "json_object"},
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = Request(url, data=data, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Authorization", "Bearer " + api_key)
+    with urlopen(req, timeout=60) as resp:
+        body = json.loads(resp.read().decode("utf-8"))
+    content = body["choices"][0]["message"]["content"]
+    return json.loads(content)
 
 
 @app.route("/api/exam/template", methods=["GET"])
@@ -342,6 +650,84 @@ def exam_parse():
     return jsonify({"questions": questions, "warnings": warnings})
 
 
+@app.route("/api/me/ai-key", methods=["GET"])
+def get_ai_key():
+    user = current_user()
+    if not user:
+        return jsonify({"error": "未登录"}), 401
+    return jsonify({"has_key": bool((user["ai_key"] or "").strip())})
+
+
+@app.route("/api/me/ai-key", methods=["POST"])
+def set_ai_key():
+    user = current_user()
+    if not user:
+        return jsonify({"error": "未登录"}), 401
+    data = request.get_json(silent=True) or {}
+    ai_key = (data.get("ai_key") or "").strip()
+    conn = get_db()
+    conn.execute("UPDATE users SET ai_key = ? WHERE id = ?", (ai_key, user["id"]))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/me/ai-key", methods=["DELETE"])
+def delete_ai_key():
+    user = current_user()
+    if not user:
+        return jsonify({"error": "未登录"}), 401
+    conn = get_db()
+    conn.execute("UPDATE users SET ai_key = '' WHERE id = ?", (user["id"],))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/ai/generate", methods=["POST"])
+def ai_generate():
+    user = current_user()
+    if not user:
+        return jsonify({"error": "未登录"}), 401
+    data = request.get_json(silent=True) or {}
+    kind = data.get("type") or ""
+    prompt = (data.get("prompt") or "").strip()
+    if not prompt:
+        return jsonify({"error": "请填写出卷描述"}), 400
+    api_key = (user["ai_key"] or "").strip()
+    if not api_key:
+        return jsonify({"error": "请先在 AI 设置里填写你的 DeepSeek API Key"}), 400
+    mode = data.get("mode") or "score"
+    if kind == "exam":
+        system = EXAM_AI_SYSTEM
+    elif kind == "test":
+        system = JUMP_AI_SYSTEM if mode == "jump" else TEST_AI_SYSTEM
+    else:
+        return jsonify({"error": "不支持的问卷类型"}), 400
+
+    try:
+        result = call_deepseek(api_key, system, prompt)
+    except HTTPError as e:
+        if e.code in (401, 403):
+            return jsonify({"error": "API Key 无效或没有权限，请检查后重试"}), 400
+        return jsonify({"error": f"AI 服务返回错误（HTTP {e.code}），请稍后重试"}), 502
+    except Exception as e:
+        return jsonify({"error": "AI 调用失败：" + str(e)}), 502
+
+    if not isinstance(result, dict):
+        return jsonify({"error": "AI 返回格式异常，请重试"}), 502
+    questions = result.get("questions")
+    if not isinstance(questions, list):
+        return jsonify({"error": "AI 返回缺少题目，请重试"}), 502
+    out = {"questions": questions}
+    if kind == "test":
+        cards = result.get("result_cards")
+        out["result_cards"] = cards if isinstance(cards, list) else []
+        if mode == "jump":
+            sanitize_jump(out["questions"], out["result_cards"])
+    return jsonify(out)
+
+
 @app.route("/api/me/email/send-code", methods=["POST"])
 def send_email_code():
     user = current_user()
@@ -463,6 +849,9 @@ def reset_password():
 
     if not new_password:
         return jsonify({"error": "新密码不能为空"}), 400
+    err = validate_password(new_password)
+    if err:
+        return jsonify({"error": err}), 400
 
     conn = get_db()
     user = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
@@ -624,6 +1013,14 @@ def update_questionnaire(qid):
 
         if status in ("draft", "published", "stopped"):
             if status == "published":
+                hits = find_blocked_words(
+                    title,
+                    description,
+                    *[qq.get("title") for qq in questions],
+                    *[o.get("text") for qq in questions for o in (qq.get("options") or [])],
+                )
+                if hits:
+                    return jsonify({"error": "内容包含敏感词，无法发布：" + "、".join(hits)}), 400
                 conn.execute(
                     "UPDATE questionnaires SET title = ?, description = ?, status = ?, full_score = ?, result_mode = ?, updated_at = datetime('now'), published_at = datetime('now') WHERE id = ?",
                     (title, description, status, full_score, result_mode, qid),
@@ -691,6 +1088,10 @@ def set_questionnaire_status(qid):
     data = request.get_json(silent=True) or {}
     status = data.get("status")
     if status == "published":
+        hits = scan_questionnaire(qid)
+        if hits:
+            conn.close()
+            return jsonify({"error": "内容包含敏感词，无法发布：" + "、".join(hits)}), 400
         conn.execute(
             "UPDATE questionnaires SET status = 'published', updated_at = datetime('now'), published_at = datetime('now') WHERE id = ?",
             (qid,),
@@ -964,6 +1365,82 @@ def my_responses():
     return jsonify(result)
 
 
+@app.route("/api/questionnaires/<int:qid>/stats", methods=["GET"])
+def questionnaire_stats(qid):
+    user = current_user()
+    if not user:
+        return jsonify({"error": "未登录"}), 401
+
+    conn = get_db()
+    q = conn.execute("SELECT * FROM questionnaires WHERE id = ?", (qid,)).fetchone()
+    if q is None:
+        conn.close()
+        return jsonify({"error": "问卷不存在"}), 404
+    if q["user_id"] != user["id"]:
+        conn.close()
+        return jsonify({"error": "无权查看"}), 403
+
+    responses = conn.execute(
+        "SELECT total_score, result_text FROM responses WHERE questionnaire_id = ?",
+        (qid,),
+    ).fetchall()
+    total = len(responses)
+
+    if q["type"] == "exam":
+        ranges = [
+            ("0-40%", 0, 40),
+            ("41-60%", 41, 60),
+            ("61-80%", 61, 80),
+            ("81-100%", 81, 100),
+        ]
+        full = q["full_score"] or 0
+        counts = [0, 0, 0, 0]
+        for r in responses:
+            pct = round((r["total_score"] or 0) / full * 100) if full else 0
+            if pct <= 40:
+                counts[0] += 1
+            elif pct <= 60:
+                counts[1] += 1
+            elif pct <= 80:
+                counts[2] += 1
+            else:
+                counts[3] += 1
+        items = [{"label": ranges[i][0], "count": counts[i]} for i in range(4)]
+    else:
+        cards = conn.execute(
+            "SELECT min_score, max_score, text, label FROM result_cards "
+            "WHERE questionnaire_id = ? ORDER BY order_index",
+            (qid,),
+        ).fetchall()
+
+        if q["result_mode"] == "jump":
+            text_to_label = {c["text"]: c["label"] or "" for c in cards}
+            counts = {}
+            for r in responses:
+                lbl = text_to_label.get(r["result_text"], "")
+                key = ("结果 " + lbl) if lbl else (r["result_text"] or "未匹配")
+                counts[key] = counts.get(key, 0) + 1
+            items = [{"label": k, "count": v} for k, v in counts.items()]
+        else:
+            matched = set()
+            items = []
+            for c in cards:
+                lo, hi = c["min_score"], c["max_score"]
+                cnt = 0
+                for ri, r in enumerate(responses):
+                    if lo <= (r["total_score"] or 0) <= hi:
+                        cnt += 1
+                        matched.add(ri)
+                label = c["label"] or f"{lo}-{hi}分"
+                items.append({"label": label, "count": cnt})
+            leftover = sum(1 for ri in range(total) if ri not in matched)
+            if leftover:
+                items.append({"label": "未匹配", "count": leftover})
+
+    conn.close()
+    return jsonify({"type": q["type"], "items": items, "total": total})
+
+
 @app.route("/api/responses/<int:rid>", methods=["DELETE"])
 def delete_response(rid):
     user = current_user()
@@ -1008,34 +1485,65 @@ def submit_questionnaire(qid):
     if q["type"] == "exam":
         total_score = 0
         answer_detail = []
+        review = []
         for i, question in enumerate(questions):
             qtype = question["type"]
             qscore = question["score"] or 0
             ans = answers[i] if i < len(answers) else None
             got = 0
             opts = conn.execute(
-                "SELECT is_correct FROM options WHERE question_id = ? ORDER BY order_index",
+                "SELECT text, is_correct FROM options WHERE question_id = ? ORDER BY order_index",
                 (question["id"],),
             ).fetchall()
+
+            correct_texts = [o["text"] for o in opts if o["is_correct"]]
+            my_texts = []
+            opt_list = []
+
             if qtype in ("single", "judge"):
                 if isinstance(ans, int) and 0 <= ans < len(opts) and opts[ans]["is_correct"]:
                     got = qscore
+                if isinstance(ans, int) and 0 <= ans < len(opts):
+                    my_texts = [opts[ans]["text"]]
+                opt_list = [
+                    {"text": o["text"], "is_correct": bool(o["is_correct"]), "chosen": ans == oi}
+                    for oi, o in enumerate(opts)
+                ]
             elif qtype == "multiple":
                 if isinstance(ans, list):
                     correct = {oi for oi, o in enumerate(opts) if o["is_correct"]}
                     chosen = {oi for oi in ans if isinstance(oi, int)}
                     if chosen == correct:
                         got = qscore
+                if isinstance(ans, list):
+                    my_texts = [opts[oi]["text"] for oi in ans if isinstance(oi, int) and 0 <= oi < len(opts)]
+                opt_list = [
+                    {"text": o["text"], "is_correct": bool(o["is_correct"]), "chosen": (isinstance(ans, list) and oi in ans)}
+                    for oi, o in enumerate(opts)
+                ]
             elif qtype == "fill":
                 refs = [a.strip() for a in (question["answer"] or "").split("|") if a.strip()]
                 if isinstance(ans, str) and ans.strip() in refs:
                     got = qscore
+                correct_texts = refs
+                if isinstance(ans, str) and ans.strip():
+                    my_texts = [ans.strip()]
+
             total_score += got
             answer_detail.append({
                 "title": question["title"],
                 "answer": ans,
                 "correct": got > 0,
                 "score": got,
+            })
+            review.append({
+                "title": question["title"],
+                "type": qtype,
+                "score": got,
+                "correct": got > 0,
+                "options": opt_list,
+                "correct_answer": correct_texts,
+                "my_answer": my_texts,
             })
 
         sum_score = sum((qq["score"] or 0) for qq in questions)
@@ -1064,6 +1572,7 @@ def submit_questionnaire(qid):
             "type": "exam",
             "total_score": total_score,
             "full_score": full_score,
+            "review": review,
         })
 
     if q["result_mode"] == "jump":
@@ -1168,6 +1677,86 @@ def submit_questionnaire(qid):
     })
 
 
+@app.route("/api/admin/users", methods=["GET"])
+def admin_users():
+    user = current_user()
+    if not is_super(user):
+        return jsonify({"error": "无权限"}), 403
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id, username, role, email, created_at FROM users ORDER BY id"
+    ).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/admin/users/<int:uid>/role", methods=["POST"])
+def admin_set_role(uid):
+    user = current_user()
+    if not is_super(user):
+        return jsonify({"error": "无权限"}), 403
+    data = request.get_json(silent=True) or {}
+    role = data.get("role")
+    if role not in ("admin", "user"):
+        return jsonify({"error": "无效角色"}), 400
+    conn = get_db()
+    target = conn.execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone()
+    if target is None:
+        conn.close()
+        return jsonify({"error": "用户不存在"}), 404
+    if target["role"] == "super":
+        conn.close()
+        return jsonify({"error": "不能修改最高管理员"}), 403
+    conn.execute("UPDATE users SET role = ? WHERE id = ?", (role, uid))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/admin/questionnaires", methods=["GET"])
+def admin_questionnaires():
+    user = current_user()
+    if not is_admin(user):
+        return jsonify({"error": "无权限"}), 403
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT q.id, q.title, q.type, q.status, q.updated_at, u.username AS author, "
+        "(SELECT COUNT(*) FROM responses WHERE questionnaire_id = q.id) AS response_count "
+        "FROM questionnaires q JOIN users u ON u.id = q.user_id ORDER BY q.updated_at DESC"
+    ).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/admin/questionnaires/<int:qid>/status", methods=["POST"])
+def admin_set_questionnaire_status(qid):
+    user = current_user()
+    if not is_admin(user):
+        return jsonify({"error": "无权限"}), 403
+    data = request.get_json(silent=True) or {}
+    status = data.get("status")
+    if status not in ("published", "stopped"):
+        return jsonify({"error": "无效状态"}), 400
+    conn = get_db()
+    q = conn.execute("SELECT * FROM questionnaires WHERE id = ?", (qid,)).fetchone()
+    if q is None:
+        conn.close()
+        return jsonify({"error": "问卷不存在"}), 404
+    if status == "published":
+        conn.execute(
+            "UPDATE questionnaires SET status = 'published', updated_at = datetime('now'), published_at = datetime('now') WHERE id = ?",
+            (qid,),
+        )
+    else:
+        conn.execute(
+            "UPDATE questionnaires SET status = 'stopped', updated_at = datetime('now') WHERE id = ?",
+            (qid,),
+        )
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "status": status})
+
+
 # 前端打包产物目录（生产环境由后端统一托管）
 DIST_DIR = Path(__file__).parent.parent / "frontend" / "dist"
 
@@ -1190,8 +1779,13 @@ def serve_frontend(path):
 if __name__ == "__main__":
     import os
 
-    from waitress import serve
+    if os.environ.get("FLASK_DEV") == "1":
+        # 本地开发模式：Flask 自带服务器 + 热重载，跑在 5000（前端 Vite 代理指向这里）
+        app.run(debug=True, host="0.0.0.0", port=5000)
+    else:
+        # 生产模式：waitress，端口由 PORT 环境变量决定（默认 8080）
+        from waitress import serve
 
-    port = int(os.environ.get("PORT", "8080"))
-    print(f"问卷系统已启动：http://0.0.0.0:{port}")
-    serve(app, host="0.0.0.0", port=port)
+        port = int(os.environ.get("PORT", "8080"))
+        print(f"问卷系统已启动：http://0.0.0.0:{port}")
+        serve(app, host="0.0.0.0", port=port)

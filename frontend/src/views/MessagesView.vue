@@ -1,6 +1,8 @@
 <script setup>
 import { ref, computed, onMounted } from 'vue'
+import { useUserStore } from '../stores/user.js'
 
+const user = useUserStore()
 const list = ref([])
 const loading = ref(true)
 const view = ref('')
@@ -30,10 +32,6 @@ const currentKindLabel = computed(() => {
   return c ? c.label : ''
 })
 
-function authHeaders() {
-  return { Authorization: localStorage.getItem('token') || '' }
-}
-
 function formatTime(s) {
   if (!s) return ''
   const [d, t] = s.split(' ')
@@ -58,10 +56,15 @@ function back() {
 }
 
 async function load() {
-  const res = await fetch('/api/me/notifications', { headers: authHeaders() })
+  const res = await fetch('/api/me/notifications', { headers: user.authHeaders() })
   const data = await res.json()
   loading.value = false
-  if (res.ok) list.value = data
+  if (res.ok) {
+    list.value = data
+    if (data.length) {
+      localStorage.setItem('lastNotifAt', data[0].created_at)
+    }
+  }
 }
 
 onMounted(load)
